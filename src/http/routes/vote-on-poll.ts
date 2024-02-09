@@ -1,11 +1,13 @@
 import { z } from "zod";
-import { FastifyInstance } from "fastify";
-import { randomUUID } from "crypto";
+import { randomUUID } from "node:crypto";
 import { prisma } from "../../lib/prisma";
+import { FastifyInstance } from "fastify";
+import { redis } from "../../lib/redis";
+import { voting } from "../../utils/voting-pub-sub";
 
 export async function voteOnPoll(app: FastifyInstance) {
   app.post("/polls/:pollId/votes", async (request, reply) => {
-    const createVotePollBody = z.object({
+    const voteOnPollBody = z.object({
       pollOptionId: z.string().uuid(),
     });
 
@@ -13,10 +15,8 @@ export async function voteOnPoll(app: FastifyInstance) {
       pollId: z.string().uuid(),
     });
 
-    /* Dado vindo da URL requisição */
     const { pollId } = voteOnPollParams.parse(request.params);
-    /* Dado vindo do corpo da requisição */
-    const { pollOptionId } = createVotePollBody.parse(request.body);
+    const { pollOptionId } = voteOnPollBody.parse(request.body);
 
     let { sessionId } = request.cookies;
 
@@ -39,11 +39,21 @@ export async function voteOnPoll(app: FastifyInstance) {
             id: userPreviousVoteOnPoll.id,
           },
         });
-        return reply.status(200).send({ message: "Vote updated." });
+
+        const votes = await redis.zincrby(
+          pollId,
+          -1,
+          userPreviousVoteOnPoll.pollOptionId
+        );
+
+        voting.publish(pollId, {
+          pollOptionId: userPreviousVoteOnPoll.pollOptionId,
+          votes: Number(votes),
+        });
       } else if (userPreviousVoteOnPoll) {
         return reply
           .status(400)
-          .send({ message: "User already voted on this poll." });
+          .send({ message: "You have already voted on this poll" });
       }
     }
 
@@ -52,7 +62,7 @@ export async function voteOnPoll(app: FastifyInstance) {
 
       reply.setCookie("sessionId", sessionId, {
         path: "/",
-        maxAge: 60 * 60 * 24 * 30,
+        maxAge: 60 * 60 * 24 * 30, // 30 days
         signed: true,
         httpOnly: true,
       });
@@ -60,10 +70,17 @@ export async function voteOnPoll(app: FastifyInstance) {
 
     await prisma.vote.create({
       data: {
-        pollOptionId,
         sessionId,
         pollId,
+        pollOptionId,
       },
+    });
+
+    const votes = await redis.zincrby(pollId, 1, pollOptionId);
+
+    voting.publish(pollId, {
+      pollOptionId,
+      votes: Number(votes),
     });
 
     return reply.status(201).send();
